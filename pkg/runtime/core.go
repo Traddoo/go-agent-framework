@@ -2,16 +2,19 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/thomasfaulds/go-agent-framework/pkg/agent"
-	"github.com/thomasfaulds/go-agent-framework/pkg/comms"
-	"github.com/thomasfaulds/go-agent-framework/pkg/memory"
-	"github.com/thomasfaulds/go-agent-framework/pkg/monitoring"
-	"github.com/thomasfaulds/go-agent-framework/pkg/tools"
-	"github.com/thomasfaulds/go-agent-framework/pkg/workflow"
+	"github.com/traddoo/go-agent-framework/pkg/agent"
+	"github.com/traddoo/go-agent-framework/pkg/comms"
+	"github.com/traddoo/go-agent-framework/pkg/memory"
+	"github.com/traddoo/go-agent-framework/pkg/monitoring"
+	"github.com/traddoo/go-agent-framework/pkg/tools"
+	"github.com/traddoo/go-agent-framework/pkg/workflow"
 )
 
 // Runtime represents the core system that coordinates agents and resources
@@ -20,7 +23,7 @@ type Runtime struct {
 	AgentMgr    *AgentManager
 	MemoryStore memory.Interface
 	CommBus     comms.Bus
-	WorkflowEng workflow.Engine
+	WorkflowEng *workflow.Engine
 	ToolReg     tools.Registry
 	Monitor     monitoring.System
 	Scheduler   *Scheduler
@@ -113,6 +116,18 @@ func (r *Runtime) Start(ctx context.Context) error {
 	}
 	
 	// Initialize and start all components
+	if r.Scheduler != nil {
+		if err := r.Scheduler.Start(ctx); err != nil {
+			return err
+		}
+	}
+	
+	// Initialize workflow engine if not already initialized
+	if r.WorkflowEng == nil {
+		r.WorkflowEng = workflow.NewEngine()
+	}
+	
+	// Initialize other components here if needed
 	// This would start memory, comms, monitoring, etc.
 	
 	r.isRunning = true
@@ -129,9 +144,9 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	defer cancel()
 
 	// Stop accepting new tasks
-	r.Scheduler.Stop()
+	r.Scheduler.Stop(ctx)
 
-	// Wait for running tasks
+	// Wait for running tasks to complete
 	done := make(chan struct{})
 	go func() {
 		r.AgentMgr.WaitForRunningTasks()
@@ -153,7 +168,7 @@ func (r *Runtime) CreateAgent(ctx context.Context, cfg *agent.Config) (*agent.Ag
 	}
 	
 	// Create a new agent
-	agent, err := agent.New(cfg)
+	agent, err := agent.NewAgent(ctx, cfg)  // Changed from agent.New to agent.NewAgent
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +209,91 @@ func (r *Runtime) SubmitTask(ctx context.Context, task *Task, targetID string) (
 	
 	task.CreatedAt = time.Now()
 	task.AssignedTo = targetID
+	
+	// Check if this is a workflow task
+	if task.Workflow != nil && r.WorkflowEng != nil {
+		// Register the workflow if not already registered
+		_, err := r.WorkflowEng.GetWorkflow(task.Workflow.ID)
+		if err != nil {
+			if err := r.WorkflowEng.RegisterWorkflow(task.Workflow); err != nil {
+				return "", fmt.Errorf("failed to register workflow: %w", err)
+			}
+		}
+		
+		// Create a context with all necessary dependencies for the workflow
+		workflowCtx := context.WithValue(ctx, "agent_manager", r.AgentMgr)
+		workflowCtx = context.WithValue(workflowCtx, "tool_registry", r.ToolReg)
+		workflowCtx = context.WithValue(workflowCtx, "workflow_engine", r.WorkflowEng)
+		
+		// Create an agent executor function
+		agentExecutor := func(ctx context.Context, agentID string, input map[string]interface{}) (map[string]interface{}, error) {
+			agent, err := r.AgentMgr.GetAgent(ctx, agentID)
+			if err != nil {
+				return nil, fmt.Errorf("agent not found: %w", err)
+			}
+			
+			// Create a task for the agent
+			agentTask := map[string]interface{}{
+				"Description": fmt.Sprintf("Execute workflow step: %s", task.Workflow.ID),
+				"Input":       input,
+			}
+			
+			// Special handling for orchestrator workflows
+			if task.Workflow.Type == "orchestrator_workers" {
+				// If this is the orchestrator agent
+				orchestratorStep := task.Workflow.Steps[task.Workflow.OrchestratorStep]
+				if orchestratorStep.AgentID == agentID {
+					// Create mock worker assignments
+					workerAssignments := make(map[string]interface{})
+					
+					// For each non-orchestrator step, create an assignment
+					for i, step := range task.Workflow.Steps {
+						if i != task.Workflow.OrchestratorStep {
+							workerAssignments[step.ID] = map[string]interface{}{
+								"task": fmt.Sprintf("Task for %s", step.Name),
+								"input": input,
+								"agent_id": step.AgentID,
+							}
+						}
+					}
+					
+					// Return a fake orchestrator result with assignments
+					return map[string]interface{}{
+						"worker_assignments": workerAssignments,
+						"plan": map[string]interface{}{
+							"subtasks": workerAssignments,
+						},
+					}, nil
+				}
+			}
+			
+			// For non-orchestrator agents or other workflow types
+			return agent.ExecuteTask(ctx, agentTask)
+		}
+		workflowCtx = context.WithValue(workflowCtx, "agent_executor", agentExecutor)
+		
+		// Execute the workflow
+		go func() {
+			result, err := r.WorkflowEng.ExecuteWorkflow(workflowCtx, task.Workflow.ID, task.Input)
+			if err != nil {
+				// Update task status to failed
+				r.Scheduler.UpdateTaskStatus(ctx, task.ID, &TaskStatus{
+					ID:        task.ID,
+					State:     "failed",
+					Error:     err.Error(),
+					Progress:  0,
+				})
+			} else {
+				// Update task status to completed
+				r.Scheduler.UpdateTaskStatus(ctx, task.ID, &TaskStatus{
+					ID:        task.ID,
+					State:     "completed",
+					Progress:  1.0,
+					Result:    result,
+				})
+			}
+		}()
+	}
 	
 	// Submit the task to the scheduler
 	if err := r.Scheduler.ScheduleTask(ctx, task); err != nil {

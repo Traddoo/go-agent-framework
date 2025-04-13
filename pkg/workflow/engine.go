@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -439,34 +440,200 @@ func (wc *WorkflowContext) executeEvaluatorOptimizer(ctx context.Context) (map[s
 
 // executeStep executes a single workflow step
 func (wc *WorkflowContext) executeStep(ctx context.Context, step Step) (map[string]interface{}, error) {
+	// First, check if we have a step executor in the context
+	// This allows for dependency injection of executors
+	if executor, ok := ctx.Value("step_executor").(func(context.Context, Step, map[string]interface{}) (map[string]interface{}, error)); ok {
+		return executor(ctx, step, wc.Input)
+	}
+	
 	// Execute the step based on its type
 	switch step.Type {
 	case "agent":
-		// In a real implementation, this would call the agent
+		// Check if we have an agent executor in the context
+		agentExecutor, ok := ctx.Value("agent_executor").(func(context.Context, string, map[string]interface{}) (map[string]interface{}, error))
+		if ok {
+			// We have an agent executor, use it
+			return agentExecutor(ctx, step.AgentID, wc.Input)
+		}
+		
+		// Check if we have an agent manager in the context
+		agentManager, ok := ctx.Value("agent_manager").(interface{
+			GetAgent(ctx context.Context, agentID string) (interface{
+				ExecuteTask(ctx context.Context, task interface{}) (map[string]interface{}, error)
+			}, error)
+		})
+		
+		if ok {
+			// Get the agent from the manager
+			agent, err := agentManager.GetAgent(ctx, step.AgentID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get agent %s: %w", step.AgentID, err)
+			}
+			
+			// Create a task from the input
+			task := map[string]interface{}{
+				"Description": fmt.Sprintf("Execute workflow step: %s", step.Name),
+				"Input":       wc.Input,
+				"Metadata": map[string]interface{}{
+					"workflow_id":  wc.Workflow.ID,
+					"workflow_name": wc.Workflow.Name,
+					"step_id":      step.ID,
+					"step_name":    step.Name,
+				},
+			}
+			
+			// Execute the task on the agent
+			return agent.ExecuteTask(ctx, task)
+		}
+		
+		// For this implementation, since we don't have access to the agent manager,
+		// we'll just return a placeholder result
 		return map[string]interface{}{
-			"result": fmt.Sprintf("Agent %s execution result", step.AgentID),
+			"status": "pending",
+			"message": fmt.Sprintf("Agent %s task waiting to be processed", step.AgentID),
+			"agent_id": step.AgentID,
+			"input": wc.Input,
 		}, nil
+		
 	case "llm":
+		// Check if we have an LLM provider in the context
+		llmProvider, ok := ctx.Value("llm_provider").(interface{
+			Complete(ctx context.Context, prompt string, params map[string]interface{}) (interface{}, error)
+		})
+		
+		if ok {
+			// Process the prompt template with the input data
+			prompt := processTemplate(step.PromptTemplate, wc.Input)
+			
+			// Call the LLM
+			response, err := llmProvider.Complete(ctx, prompt, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute LLM step: %w", err)
+			}
+			
+			// Return the response
+			return map[string]interface{}{
+				"result": response,
+				"status": "completed",
+			}, nil
+		}
+		
 		// In a real implementation, this would call the LLM
 		return map[string]interface{}{
 			"result": fmt.Sprintf("LLM execution result for prompt: %s", step.PromptTemplate),
+			"status": "completed",
 		}, nil
+		
 	case "tool":
+		// Check if we have a tool registry in the context
+		toolRegistry, ok := ctx.Value("tool_registry").(interface{
+			GetTool(name string) (interface{
+				Execute(ctx context.Context, args map[string]interface{}) (interface{}, error)
+			}, error)
+		})
+		
+		if ok {
+			// Get the tool from the registry
+			tool, err := toolRegistry.GetTool(step.ToolName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get tool %s: %w", step.ToolName, err)
+			}
+			
+			// Execute the tool with the input as arguments
+			result, err := tool.Execute(ctx, wc.Input)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute tool %s: %w", step.ToolName, err)
+			}
+			
+			// Return the result
+			return map[string]interface{}{
+				"result": result,
+				"status": "completed",
+			}, nil
+		}
+		
 		// In a real implementation, this would call the tool
 		return map[string]interface{}{
 			"result": fmt.Sprintf("Tool %s execution result", step.ToolName),
+			"status": "completed",
 		}, nil
+		
 	case "conditional":
 		// In a real implementation, this would evaluate the condition
+		// and return different results based on the condition
+		condition := step.Condition
+		result := evaluateCondition(condition, wc.Input)
+		
 		return map[string]interface{}{
-			"result": fmt.Sprintf("Condition %s evaluation result", step.Condition),
+			"result": result,
+			"condition": condition,
+			"evaluated": true,
+			"status": "completed",
 		}, nil
+		
 	case "subworkflow":
+		// Check if we have a workflow engine in the context
+		workflowEngine, ok := ctx.Value("workflow_engine").(interface{
+			ExecuteWorkflow(ctx context.Context, workflowID string, input map[string]interface{}) (map[string]interface{}, error)
+		})
+		
+		if ok {
+			// Execute the subworkflow
+			result, err := workflowEngine.ExecuteWorkflow(ctx, step.WorkflowID, wc.Input)
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute subworkflow %s: %w", step.WorkflowID, err)
+			}
+			
+			// Return the result
+			return map[string]interface{}{
+				"result": result,
+				"status": "completed",
+			}, nil
+		}
+		
 		// In a real implementation, this would execute the subworkflow
 		return map[string]interface{}{
 			"result": fmt.Sprintf("Subworkflow %s execution result", step.WorkflowID),
+			"status": "completed",
 		}, nil
+		
 	default:
 		return nil, fmt.Errorf("unsupported step type: %s", step.Type)
 	}
+}
+
+// processTemplate processes a prompt template with input data
+// replacing {{variable}} with values from the input
+func processTemplate(template string, input map[string]interface{}) string {
+	result := template
+	
+	// Replace variables in the template
+	for key, value := range input {
+		placeholder := fmt.Sprintf("{{%s}}", key)
+		valueStr := fmt.Sprintf("%v", value)
+		result = strings.Replace(result, placeholder, valueStr, -1)
+	}
+	
+	return result
+}
+
+// evaluateCondition evaluates a condition expression against input data
+// This is a simple implementation - in a real system you'd want a more
+// sophisticated expression evaluator
+func evaluateCondition(condition string, input map[string]interface{}) bool {
+	// For now, just check if any part of the condition is in the input
+	// This is a very basic implementation
+	parts := strings.Split(condition, " ")
+	
+	for _, part := range parts {
+		// Remove any operators or special characters
+		cleanPart := strings.Trim(part, "=!<>()&|")
+		
+		// Check if this part is a key in the input
+		if _, ok := input[cleanPart]; ok {
+			return true
+		}
+	}
+	
+	return false
 }

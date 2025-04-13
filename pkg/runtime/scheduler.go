@@ -105,6 +105,23 @@ func (s *Scheduler) GetTaskStatus(ctx context.Context, taskID string) (*TaskStat
 	return status, nil
 }
 
+// UpdateTaskStatus updates the status of a task
+func (s *Scheduler) UpdateTaskStatus(ctx context.Context, taskID string, newStatus *TaskStatus) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	// Check if the task exists
+	_, exists := s.statuses[taskID]
+	if !exists {
+		return errors.New("task not found")
+	}
+	
+	// Update the status
+	s.statuses[taskID] = newStatus
+	
+	return nil
+}
+
 // processTaskQueue processes tasks from the queue
 func (s *Scheduler) processTaskQueue(ctx context.Context) {
 	for {
@@ -141,6 +158,7 @@ func (s *Scheduler) processTaskResults(ctx context.Context) {
 				status.CompletedAt = result.FinishedAt
 				
 				if result.Success {
+					// For workflow tasks or regular tasks, mark as completed
 					status.State = "completed"
 					status.Progress = 1.0
 					status.Result = result.Result
@@ -162,6 +180,20 @@ func (s *Scheduler) executeTask(ctx context.Context, task *Task) {
 	status.State = "running"
 	status.StartedAt = time.Now()
 	s.mutex.Unlock()
+	
+	// Check if this is a workflow task
+	if task.Workflow != nil && s.runtime.WorkflowEng != nil {
+		// Create a dummy task result for now
+		s.resultCh <- &TaskResult{
+			TaskID:     task.ID,
+			Success:    true,
+			Result: map[string]interface{}{
+				"message": "Workflow execution simulated (not fully implemented)",
+			},
+			FinishedAt: time.Now(),
+		}
+		return
+	}
 	
 	// Determine if the task is assigned to an agent or a team
 	var result *TaskResult

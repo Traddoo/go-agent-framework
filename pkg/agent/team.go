@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -220,11 +221,10 @@ func (t *Team) executeOrchestrator(ctx context.Context, task interface{}) (map[s
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 	
-	// Check if we have a coordinator
 	if t.Coordinator == nil {
 		return nil, errors.New("no coordinator agent assigned")
 	}
-	
+
 	// Convert task to a map if it's not already
 	taskMap, ok := task.(map[string]interface{})
 	if !ok {
@@ -232,94 +232,72 @@ func (t *Team) executeOrchestrator(ctx context.Context, task interface{}) (map[s
 			"task": task,
 		}
 	}
-	
-	// Add worker agents to the task
+
+	// Add worker information to the task
 	workers := make(map[string]interface{})
 	for id, agent := range t.Agents {
 		if id != t.Coordinator.ID {
 			workers[id] = map[string]interface{}{
-				"id":   agent.ID,
-				"name": agent.Name,
+				"id":          agent.ID,
+				"name":        agent.Name,
+				"description": agent.Description,
 			}
 		}
 	}
-	
-	taskMap["workers"] = workers
-	
-	// Execute the task on the coordinator
-	initialPlan, err := t.Coordinator.ExecuteTask(ctx, taskMap)
+	taskMap["available_workers"] = workers
+
+	// First, let the coordinator plan the work
+	planTask := &Task{
+		ID:          uuid.New().String(),
+		Description: "Plan the research project workflow",
+		Input:       taskMap,
+		Status:      "pending",
+	}
+
+	planResult, err := t.Coordinator.ExecuteTask(ctx, planTask)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("coordinator planning failed: %w", err)
 	}
-	
-	// The coordinator should return a plan with subtasks for workers
-	plan, ok := initialPlan["plan"].(map[string]interface{})
+
+	// Extract the work assignments from the plan
+	assignments, ok := planResult["assignments"].(map[string]interface{})
 	if !ok {
-		return nil, errors.New("coordinator did not return a valid plan")
+		return nil, errors.New("coordinator did not provide valid work assignments")
 	}
-	
-	// Execute subtasks on workers
-	subtasks, ok := plan["subtasks"].(map[string]interface{})
-	if !ok {
-		return nil, errors.New("no subtasks in plan")
-	}
-	
-	// Create channels for results and errors
-	resultCh := make(chan map[string]interface{}, len(subtasks))
-	errCh := make(chan error, len(subtasks))
-	
-	// Launch goroutines for each subtask
-	for workerID, subtask := range subtasks {
-		// Find the worker agent
+
+	// Execute each worker's assignment in sequence
+	results := make(map[string]interface{})
+	for workerID, assignment := range assignments {
 		worker, exists := t.Agents[workerID]
 		if !exists {
-			continue // Skip if worker not found
+			continue
 		}
-		
-		go func(a *Agent, st interface{}) {
-			result, err := a.ExecuteTask(ctx, st)
-			if err != nil {
-				errCh <- err
-			} else {
-				resultCh <- result
-			}
-		}(worker, subtask)
-	}
-	
-	// Collect results
-	workerResults := make(map[string]interface{})
-	errors := make([]string, 0)
-	
-	// Wait for all workers to complete or context to cancel
-	for i := 0; i < len(subtasks); i++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-errCh:
-			errors = append(errors, err.Error())
-		case result := <-resultCh:
-			for k, v := range result {
-				workerResults[k] = v
-			}
+
+		workerTask := &Task{
+			ID:          uuid.New().String(),
+			Description: fmt.Sprintf("Execute assigned work for %s", worker.Name),
+			Input:       map[string]interface{}{"assignment": assignment},
+			Status:      "pending",
 		}
+
+		result, err := worker.ExecuteTask(ctx, workerTask)
+		if err != nil {
+			return nil, fmt.Errorf("worker %s failed: %w", worker.Name, err)
+		}
+
+		results[workerID] = result
 	}
-	
-	// Add errors to results
-	if len(errors) > 0 {
-		workerResults["errors"] = errors
+
+	// Let the coordinator review and finalize the results
+	finalizeTask := &Task{
+		ID:          uuid.New().String(),
+		Description: "Review and finalize the research project",
+		Input: map[string]interface{}{
+			"original_task": taskMap,
+			"worker_results": results,
+		},
+		Status: "pending",
 	}
-	
-	// Send the results back to the coordinator for final synthesis
-	finalTaskMap := map[string]interface{}{
-		"task":          taskMap["task"],
-		"workerResults": workerResults,
-		"action":        "synthesize",
-	}
-	
-	finalResult, err := t.Coordinator.ExecuteTask(ctx, finalTaskMap)
-	if err != nil {
-		return nil, err
-	}
-	
-	return finalResult, nil
+
+	return t.Coordinator.ExecuteTask(ctx, finalizeTask)
 }

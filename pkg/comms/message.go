@@ -131,3 +131,4 @@ var ContentTypes = struct {
 	Task:      "application/task",
 	Result:    "application/result",
 }
+

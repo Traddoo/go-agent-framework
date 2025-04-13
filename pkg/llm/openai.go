@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	
-	"github.com/thomasfaulds/go-agent-framework/pkg/tools"
+	"github.com/traddoo/go-agent-framework/pkg/tools"
 )
 
 // OpenAILLM implements the Interface for OpenAI models

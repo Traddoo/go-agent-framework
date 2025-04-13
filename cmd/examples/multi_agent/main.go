@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/thomasfaulds/go-agent-framework/pkg/agent"
-	"github.com/thomasfaulds/go-agent-framework/pkg/comms"
-	"github.com/thomasfaulds/go-agent-framework/pkg/memory"
-	"github.com/thomasfaulds/go-agent-framework/pkg/runtime"
-	"github.com/thomasfaulds/go-agent-framework/pkg/tools"
-	"github.com/thomasfaulds/go-agent-framework/pkg/workflow"
+	"github.com/traddoo/go-agent-framework/pkg/agent"
+	"github.com/traddoo/go-agent-framework/pkg/comms"
+	"github.com/traddoo/go-agent-framework/pkg/memory"
+	"github.com/traddoo/go-agent-framework/pkg/runtime"
+	"github.com/traddoo/go-agent-framework/pkg/tools"
+	"github.com/traddoo/go-agent-framework/pkg/workflow"
 )
 
 func main() {
@@ -47,7 +50,7 @@ func main() {
 
 	// Register standard tools
 	toolRegistry := tools.NewToolRegistry()
-	registerStandardTools(toolRegistry)
+	registerStandardTools(toolRegistry, sharedMemory, commBus)
 
 	// Create a document in shared memory for agents to collaborate on
 	projectDoc := &memory.Document{
@@ -84,6 +87,13 @@ You have access to tools to search for information and read documents.`,
 	if err != nil {
 		log.Fatalf("Failed to create research agent: %v", err)
 	}
+	
+	// Register tools with research agent
+	for _, tool := range toolRegistry.ListTools() {
+		if err := researchAgent.RegisterTool(tool); err != nil {
+			log.Printf("Warning: Failed to register tool %s with research agent: %v", tool.Name(), err)
+		}
+	}
 
 	// Create the writing agent
 	writingAgentConfig := &agent.Config{
@@ -101,6 +111,13 @@ You have access to tools to read and update documents.`,
 	writingAgent, err := rt.CreateAgent(ctx, writingAgentConfig)
 	if err != nil {
 		log.Fatalf("Failed to create writing agent: %v", err)
+	}
+	
+	// Register tools with writing agent
+	for _, tool := range toolRegistry.ListTools() {
+		if err := writingAgent.RegisterTool(tool); err != nil {
+			log.Printf("Warning: Failed to register tool %s with writing agent: %v", tool.Name(), err)
+		}
 	}
 
 	// Create the review agent
@@ -120,6 +137,13 @@ You have access to tools to read documents and provide feedback.`,
 	if err != nil {
 		log.Fatalf("Failed to create review agent: %v", err)
 	}
+	
+	// Register tools with review agent
+	for _, tool := range toolRegistry.ListTools() {
+		if err := reviewAgent.RegisterTool(tool); err != nil {
+			log.Printf("Warning: Failed to register tool %s with review agent: %v", tool.Name(), err)
+		}
+	}
 
 	// Create a team with these agents
 	teamConfig := &agent.TeamConfig{
@@ -136,28 +160,40 @@ You have access to tools to read documents and provide feedback.`,
 	}
 
 	// Create a workflow for the team
-	workflow := createResearchWorkflow()
+	workflow := createResearchWorkflow(researchAgent.ID, writingAgent.ID, reviewAgent.ID)
 
 	// Create a task for the team with the workflow
 	task := &runtime.Task{
 		Description: "Research and write a comprehensive article on multi-agent systems",
 		Input: map[string]interface{}{
 			"topic": "Multi-Agent Systems in Artificial Intelligence",
-			"requirements": "Include sections on architecture, communication, coordination mechanisms, and real-world applications",
+			"requirements": map[string]interface{}{
+				"sections": []string{
+					"Introduction to Multi-Agent Systems",
+					"Architecture and Components",
+					"Communication Protocols",
+					"Coordination Mechanisms",
+					"Real-world Applications",
+					"Future Directions",
+				},
+				"minLength": 2000,
+				"maxLength": 5000,
+				"format": "markdown",
+				"style": "technical but accessible",
+			},
 			"documentID": projectDoc.ID,
+			"deadline": time.Now().Add(30 * time.Minute),
 		},
 		Workflow: workflow,
 		Priority: 1,
 		Deadline: time.Now().Add(30 * time.Minute),
 	}
 
-	// Submit the task to the team
+	// Submit the task and wait for completion
 	taskID, err := rt.SubmitTask(ctx, task, team.ID)
 	if err != nil {
 		log.Fatalf("Failed to submit task: %v", err)
 	}
-
-	log.Printf("Submitted task with ID: %s to team: %s", taskID, team.Name)
 
 	// Poll for task completion
 	for {
@@ -172,25 +208,38 @@ You have access to tools to read documents and provide feedback.`,
 			if status.State == "completed" {
 				log.Printf("Task completed successfully")
 				
-				// Retrieve the final document
+				// Read the final document
 				finalDoc, err := sharedMemory.ReadDocument(ctx, projectDoc.ID)
 				if err != nil {
 					log.Fatalf("Failed to read final document: %v", err)
 				}
 				
-				log.Printf("Final document:\n%s", finalDoc.Content)
+				// Create output directory if it doesn't exist
+				outputDir := "output"
+				if err := os.MkdirAll(outputDir, 0755); err != nil {
+					log.Fatalf("Failed to create output directory: %v", err)
+				}
+				
+				// Save and display the final document
+				outputPath := filepath.Join(outputDir, "research_project.md")
+				if err := os.WriteFile(outputPath, []byte(finalDoc.Content), 0644); err != nil {
+					log.Fatalf("Failed to save document: %v", err)
+				}
+				
+				log.Printf("Final document saved to: %s", outputPath)
+				log.Printf("Final document content:\n%s", finalDoc.Content)
 			} else {
-				log.Printf("Task failed with error: %s", status.Error)
+				log.Printf("Task failed: %v", status.Error)
 			}
 			break
 		}
 
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
 
 // createResearchWorkflow creates a workflow for the research team
-func createResearchWorkflow() *workflow.Workflow {
+func createResearchWorkflow(researchAgentID, writingAgentID, reviewAgentID string) *workflow.Workflow {
 	// Create an orchestrator-workers workflow
 	builder := workflow.NewOrchestratorBuilder(
 		"Research Project Workflow",
@@ -198,28 +247,41 @@ func createResearchWorkflow() *workflow.Workflow {
 	)
 	
 	// Set the research agent as the orchestrator
-	builder.SetOrchestratorAgent("Research Coordinator", "ResearchAgent")
+	builder.SetOrchestratorAgent("Research Coordinator", researchAgentID)
 	
-	// Add worker steps
-	builder.AddWorkerAgent("Information Gathering", "ResearchAgent")
-	builder.AddWorkerAgent("Content Writing", "WritingAgent")
-	builder.AddWorkerAgent("Content Review", "ReviewAgent")
+	// Add worker agents with their roles
+	builder.AddWorkerAgent("Research Phase", researchAgentID)
+	builder.AddWorkerAgent("Writing Phase", writingAgentID)
+	builder.AddWorkerAgent("Review Phase", reviewAgentID)
 	
 	return builder.Build()
 }
 
 // registerStandardTools registers standard tools with the registry
-func registerStandardTools(registry *tools.ToolRegistry) {
+func registerStandardTools(registry *tools.ToolRegistry, store memory.Interface, bus comms.Bus) {
 	// Register document tools
-	registry.RegisterTool(&DocumentReadTool{})
-	registry.RegisterTool(&DocumentUpdateTool{})
-	
+	docReadTool := &DocumentReadTool{
+		MemoryStore: store,
+	}
+	registry.RegisterTool(docReadTool)
+
+	docUpdateTool := &DocumentUpdateTool{
+		MemoryStore: store,
+	}
+	registry.RegisterTool(docUpdateTool)
+
 	// Register information tools
-	registry.RegisterTool(&SearchTool{})
-	registry.RegisterTool(&SummarizeTool{})
-	
+	searchTool := &SearchTool{}
+	registry.RegisterTool(searchTool)
+
+	summarizeTool := &SummarizeTool{}
+	registry.RegisterTool(summarizeTool)
+
 	// Register communication tools
-	registry.RegisterTool(&MessageTool{})
+	messageTool := &MessageTool{
+		CommBus: bus,
+	}
+	registry.RegisterTool(messageTool)
 }
 
 // DocumentReadTool reads a document from shared memory
@@ -425,9 +487,17 @@ func (t *SearchTool) Execute(ctx context.Context, args map[string]interface{}) (
 	// Extract arguments
 	query := args["query"].(string)
 	
-	// In a real implementation, this would perform an actual search
-	// For this example, we'll just return mock data
-	results := []map[string]interface{}{
+	// Get max results parameter (default to 5)
+	maxResults := 5
+	if maxResultsArg, ok := args["max_results"].(float64); ok {
+		maxResults = int(maxResultsArg)
+	}
+	
+	// Simulate a search by generating relevant results based on the query
+	// This is more dynamic than hardcoded results
+	
+	// First, generate basic results for any search about multi-agent systems
+	basicResults := []map[string]interface{}{
 		{
 			"title": "Introduction to Multi-Agent Systems",
 			"url": "https://example.com/multi-agent-systems",
@@ -443,6 +513,87 @@ func (t *SearchTool) Execute(ctx context.Context, args map[string]interface{}) (
 			"url": "https://example.com/coordination",
 			"snippet": "Coordination is essential in multi-agent systems to ensure agents work together effectively toward common goals.",
 		},
+		{
+			"title": "Architectures for Multi-Agent Systems",
+			"url": "https://example.com/architectures",
+			"snippet": "Different architectures for multi-agent systems include centralized, hierarchical, and distributed approaches, each with different tradeoffs.",
+		},
+		{
+			"title": "Applications of Multi-Agent Systems",
+			"url": "https://example.com/applications",
+			"snippet": "Multi-agent systems are used in various domains including robotics, traffic management, e-commerce, and distributed problem solving.",
+		},
+	}
+	
+	// Topic-specific results for various query types
+	topicResults := map[string][]map[string]interface{}{
+		"architecture": {
+			{
+				"title": "BDI Architecture for Intelligent Agents",
+				"url": "https://example.com/bdi-architecture",
+				"snippet": "The Belief-Desire-Intention (BDI) architecture is a framework for modeling intelligent agents based on mental attitudes.",
+			},
+			{
+				"title": "Layered Agent Architectures",
+				"url": "https://example.com/layered-architectures",
+				"snippet": "Layered architectures organize agent capabilities into hierarchical layers, from reactive behaviors to deliberative reasoning.",
+			},
+		},
+		"communication": {
+			{
+				"title": "FIPA Agent Communication Language",
+				"url": "https://example.com/fipa-acl",
+				"snippet": "FIPA ACL is a standard language for agent communication based on speech act theory, defining message types like inform, request, and query.",
+			},
+			{
+				"title": "Knowledge Query and Manipulation Language (KQML)",
+				"url": "https://example.com/kqml",
+				"snippet": "KQML is a language and protocol for exchanging information and knowledge between agents in a multi-agent system.",
+			},
+		},
+		"coordination": {
+			{
+				"title": "Contract Net Protocol for Multi-Agent Coordination",
+				"url": "https://example.com/contract-net",
+				"snippet": "The Contract Net Protocol is a task allocation mechanism where agents bid for tasks based on their capabilities and resources.",
+			},
+			{
+				"title": "Blackboard Systems for Agent Coordination",
+				"url": "https://example.com/blackboard-systems",
+				"snippet": "Blackboard systems provide a shared workspace where agents can post and access information, facilitating indirect coordination.",
+			},
+		},
+		"application": {
+			{
+				"title": "Multi-Agent Systems in Disaster Response",
+				"url": "https://example.com/disaster-response",
+				"snippet": "Multi-agent systems are used in disaster response to coordinate heterogeneous teams of robots and human responders.",
+			},
+			{
+				"title": "Trading Agent Competition",
+				"url": "https://example.com/trading-agents",
+				"snippet": "The Trading Agent Competition showcases multi-agent systems in e-commerce scenarios, with agents competing in simulated marketplaces.",
+			},
+		},
+	}
+	
+	// Process the query to find relevant results
+	results := make([]map[string]interface{}, 0)
+	
+	// First, add basic results
+	results = append(results, basicResults...)
+	
+	// Then, check if query contains any of our special topics
+	for topic, topicRes := range topicResults {
+		if strings.Contains(strings.ToLower(query), strings.ToLower(topic)) {
+			// Add the topic-specific results
+			results = append(results, topicRes...)
+		}
+	}
+	
+	// Limit results
+	if len(results) > maxResults {
+		results = results[:maxResults]
 	}
 	
 	return map[string]interface{}{

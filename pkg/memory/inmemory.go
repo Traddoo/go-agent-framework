@@ -3,6 +3,8 @@ package memory
 import (
 	"context"
 	"errors"
+	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -304,16 +306,50 @@ func (s *InMemoryStore) CreateChunk(ctx context.Context, chunk *Chunk) error {
 		chunk.Metadata = make(map[string]interface{})
 	}
 	
-	// Initialize embedding if not provided
+	// Generate embedding if not provided
 	if chunk.Embedding == nil {
-		// In a real implementation, this would compute an embedding for the content
-		chunk.Embedding = make([]float32, 0)
+		// TODO: Replace with actual embedding generation
+		// In a production system, we would call an embedding model API
+		// For example, OpenAI's text-embedding-3-small or text-embedding-3-large
+		
+		// For now, we'll create a mock embedding
+		// This is just a placeholder - real embeddings would be semantic vectors
+		embedding := generateMockEmbedding(chunk.Content)
+		chunk.Embedding = embedding
 	}
 	
 	// Store the chunk
 	s.chunks[chunk.ID] = chunk
 	
 	return nil
+}
+
+// generateMockEmbedding creates a simple mock embedding from text
+// This is just for demonstration - real systems would use embeddings from models
+func generateMockEmbedding(text string) []float32 {
+	// Create a fixed-size embedding (real ones would be 768-1536 dimensions)
+	embedding := make([]float32, 128)
+	
+	// Very simplistic approach - hash characters to positions
+	for i, char := range text {
+		pos := i % len(embedding)
+		embedding[pos] += float32(char) / 1000
+	}
+	
+	// Normalize the embedding (to unit vector)
+	var sum float32
+	for _, val := range embedding {
+		sum += val * val
+	}
+	magnitude := float32(math.Sqrt(float64(sum)))
+	
+	if magnitude > 0 {
+		for i := range embedding {
+			embedding[i] /= magnitude
+		}
+	}
+	
+	return embedding
 }
 
 // ReadChunk retrieves a chunk by ID
@@ -377,21 +413,130 @@ func (s *InMemoryStore) SearchChunks(ctx context.Context, query string, maxResul
 	// Create a slice to hold matching chunks
 	results := make([]*Chunk, 0)
 	
-	// Very basic search implementation - just check if query is contained in content
-	// In a real implementation, this would compute an embedding for the query and find similar chunks
-	query = strings.ToLower(query)
-	for _, chunk := range s.chunks {
-		if strings.Contains(strings.ToLower(chunk.Content), query) {
-			// Add a copy of the chunk to results
-			chunkCopy := *chunk
-			results = append(results, &chunkCopy)
+	// Generate an embedding for the query
+	queryEmbedding := generateMockEmbedding(query)
+	
+	// Create a map to store similarity scores using cosine similarity
+	scores := make(map[string]float64)
+	
+	// Calculate cosine similarity for each chunk's embedding
+	for id, chunk := range s.chunks {
+		if chunk.Embedding == nil || len(chunk.Embedding) == 0 {
+			// Skip chunks without embeddings
+			continue
+		}
+		
+		// Calculate cosine similarity between query embedding and chunk embedding
+		similarity := cosineSimilarity(queryEmbedding, chunk.Embedding)
+		
+		// Store scores above a threshold
+		if similarity > 0.3 { // Arbitrary threshold
+			scores[id] = similarity
 		}
 	}
 	
-	// Limit results
-	if maxResults > 0 && maxResults < len(results) {
-		results = results[:maxResults]
+	// If we found no semantic matches, fall back to text matching
+	if len(scores) == 0 {
+		// Basic text matching as fallback
+		query = strings.ToLower(query)
+		
+		for id, chunk := range s.chunks {
+			content := strings.ToLower(chunk.Content)
+			
+			var score float64
+			
+			if content == query {
+				score = 1.0
+			} else if strings.Contains(content, query) {
+				score = float64(len(query)) / float64(len(content))
+			} else {
+				// Check for word overlaps
+				queryWords := strings.Fields(query)
+				contentWords := strings.Fields(content)
+				
+				// Create maps to count word frequency
+				queryWordCount := make(map[string]int)
+				for _, word := range queryWords {
+					queryWordCount[word]++
+				}
+				
+				// Count matching words
+				matchCount := 0
+				for _, word := range contentWords {
+					if count, exists := queryWordCount[word]; exists && count > 0 {
+						matchCount++
+						queryWordCount[word]--
+					}
+				}
+				
+				if len(queryWords) > 0 {
+					score = float64(matchCount) / float64(len(queryWords))
+				}
+			}
+			
+			// Store the score
+			if score > 0 {
+				scores[id] = score
+			}
+		}
+	}
+	
+	// Sort chunks by score
+	type ScoredChunk struct {
+		Chunk *Chunk
+		Score float64
+	}
+	
+	scoredChunks := make([]ScoredChunk, 0, len(scores))
+	for id, score := range scores {
+		chunk := s.chunks[id]
+		scoredChunks = append(scoredChunks, ScoredChunk{
+			Chunk: chunk,
+			Score: score,
+		})
+	}
+	
+	// Sort by score (descending)
+	sort.Slice(scoredChunks, func(i, j int) bool {
+		return scoredChunks[i].Score > scoredChunks[j].Score
+	})
+	
+	// Take top N results
+	for i, sc := range scoredChunks {
+		if maxResults > 0 && i >= maxResults {
+			break
+		}
+		
+		// Add a copy of the chunk to results
+		chunkCopy := *sc.Chunk
+		results = append(results, &chunkCopy)
 	}
 	
 	return results, nil
+}
+
+// cosineSimilarity calculates the cosine similarity between two vectors
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	
+	var dotProduct float64
+	var magnitudeA float64
+	var magnitudeB float64
+	
+	for i := 0; i < len(a); i++ {
+		dotProduct += float64(a[i]) * float64(b[i])
+		magnitudeA += float64(a[i]) * float64(a[i])
+		magnitudeB += float64(b[i]) * float64(b[i])
+	}
+	
+	magnitudeA = math.Sqrt(magnitudeA)
+	magnitudeB = math.Sqrt(magnitudeB)
+	
+	if magnitudeA == 0 || magnitudeB == 0 {
+		return 0
+	}
+	
+	return dotProduct / (magnitudeA * magnitudeB)
 }

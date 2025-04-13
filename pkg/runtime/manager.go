@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
-	"github.com/thomasfaulds/go-agent-framework/pkg/agent"
+	"github.com/traddoo/go-agent-framework/pkg/agent"
 )
 
 // AgentManager handles agent lifecycle management
@@ -148,4 +149,22 @@ func (m *AgentManager) ListTeams(ctx context.Context) ([]*agent.Team, error) {
 	}
 	
 	return teams, nil
+}
+
+// WaitForRunningTasks waits for all running tasks to complete
+func (m *AgentManager) WaitForRunningTasks() {
+	// This is a placeholder implementation
+	// In a real implementation, you would check each agent and team
+	// for running tasks and wait for them to complete
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	
+	// For now, we'll just count the number of agents and teams
+	agentCount := len(m.agents)
+	teamCount := len(m.teams)
+	
+	if agentCount+teamCount > 0 {
+		// Give a bit of time for agents to complete their tasks
+		time.Sleep(5 * time.Second)
+	}
 }

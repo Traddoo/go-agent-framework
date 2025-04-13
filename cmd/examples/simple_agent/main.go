@@ -6,10 +6,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/thomasfaulds/go-agent-framework/pkg/agent"
-	"github.com/thomasfaulds/go-agent-framework/pkg/memory"
-	"github.com/thomasfaulds/go-agent-framework/pkg/runtime"
-	"github.com/thomasfaulds/go-agent-framework/pkg/tools"
+	"github.com/traddoo/go-agent-framework/pkg/agent"
+	"github.com/traddoo/go-agent-framework/pkg/memory"
+	"github.com/traddoo/go-agent-framework/pkg/runtime"
+	"github.com/traddoo/go-agent-framework/pkg/tools"
 )
 
 func main() {

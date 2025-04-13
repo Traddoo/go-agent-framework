@@ -9,7 +9,7 @@ import (
 	mcp_golang "github.com/metoro-io/mcp-golang"
 	"github.com/metoro-io/mcp-golang/transport"
 	"github.com/metoro-io/mcp-golang/transport/stdio"
-	"github.com/thomasfaulds/go-agent-framework/pkg/tools"
+	"github.com/traddoo/go-agent-framework/pkg/tools"
 )
 
 // MCPServer represents an MCP server that can be used by agents
