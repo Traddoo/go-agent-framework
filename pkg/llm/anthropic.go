@@ -141,9 +141,12 @@ func (a *AnthropicLLM) Complete(ctx context.Context, prompt string, params map[s
 func (a *AnthropicLLM) CompleteWithTools(ctx context.Context, prompt string, toolsList []tools.Tool, params map[string]interface{}) (*Response, error) {
 	// Check if client is initialized
 	if !a.initialized {
+		fmt.Printf("[ANTHROPIC] Initializing client with model: %s\n", a.Model)
 		if err := a.Initialize(ctx); err != nil {
+			fmt.Printf("[ANTHROPIC] Initialization error: %v\n", err)
 			return nil, err
 		}
+		fmt.Printf("[ANTHROPIC] Client initialized successfully\n")
 	}
 	
 	// Merge default params with provided params
@@ -223,11 +226,17 @@ func (a *AnthropicLLM) CompleteWithTools(ctx context.Context, prompt string, too
 		{Text: systemPrompt},
 	}
 	
+	// Log before making API call
+	fmt.Printf("[ANTHROPIC] Making API call to Anthropic, model: %s, tools: %d\n", a.Model, len(anthropicTools))
+	
 	// Make the API call
 	resp, err := a.Client.Messages.New(ctx, req)
 	if err != nil {
+		fmt.Printf("[ANTHROPIC] API error: %v\n", err)
 		return nil, fmt.Errorf("Anthropic API error: %w", err)
 	}
+	
+	fmt.Printf("[ANTHROPIC] API call successful, response received\n")
 	
 	// Process tool calls
 	toolCalls := []ToolCall{}

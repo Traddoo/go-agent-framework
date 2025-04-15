@@ -274,7 +274,7 @@ func (r *Runtime) SubmitTask(ctx context.Context, task *Task, targetID string) (
 		
 		// Execute the workflow
 		go func() {
-			result, err := r.WorkflowEng.ExecuteWorkflow(workflowCtx, task.Workflow.ID, task.Input)
+			workflowResult, err := r.WorkflowEng.ExecuteWorkflow(workflowCtx, task.Workflow.ID, task.Input)
 			if err != nil {
 				// Update task status to failed
 				r.Scheduler.UpdateTaskStatus(ctx, task.ID, &TaskStatus{
@@ -284,12 +284,21 @@ func (r *Runtime) SubmitTask(ctx context.Context, task *Task, targetID string) (
 					Progress:  0,
 				})
 			} else {
+				// Convert workflow result to map for storage in TaskStatus
+				resultMap := map[string]interface{}{
+					"workflow_id": workflowResult.WorkflowID,
+					"status": map[string]interface{}{
+						"state":    workflowResult.GetStatus().State,
+						"progress": workflowResult.GetStatus().Progress,
+					},
+				}
+				
 				// Update task status to completed
 				r.Scheduler.UpdateTaskStatus(ctx, task.ID, &TaskStatus{
 					ID:        task.ID,
 					State:     "completed",
 					Progress:  1.0,
-					Result:    result,
+					Result:    resultMap,
 				})
 			}
 		}()
@@ -317,4 +326,65 @@ func (r *Runtime) cleanup() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ExecuteWorkflow executes a workflow
+func (r *Runtime) ExecuteWorkflow(ctx context.Context, wf *workflow.Workflow) (*workflow.Result, error) {
+	result := &workflow.Result{
+		WorkflowID: wf.Name,
+	}
+	// Initialize the status properly
+	result.SetStatus(workflow.Status{
+		State:    "running",
+		Progress: 0.0,
+	})
+	
+	// Create a done channel to signal completion
+	done := make(chan struct{})
+	
+	// Execute workflow in a goroutine
+	go func() {
+		defer close(done)
+		
+		// Execute each step sequentially
+		for _, step := range wf.Steps {
+			for _, task := range step.Tasks {
+				agent, err := r.AgentMgr.GetAgent(ctx, task.AgentID)
+				if err != nil {
+					result.SetStatus(workflow.Status{
+						State:    "failed",
+						Progress: 0.0,
+						Error:    err,
+					})
+					return
+				}
+				
+				// Prepare task in the format expected by the agent
+				agentTask := map[string]interface{}{
+					"Description": fmt.Sprintf("Execute workflow task for %s", step.Name),
+					"Input":       task.Input,
+				}
+				
+				// Execute the task
+				_, err = agent.ExecuteTask(ctx, agentTask)
+				if err != nil {
+					result.SetStatus(workflow.Status{
+						State:    "failed",
+						Progress: 0.0,
+						Error:    err,
+					})
+					return
+				}
+			}
+		}
+		
+		// All steps completed successfully
+		result.SetStatus(workflow.Status{
+			State:    "completed",
+			Progress: 1.0,
+		})
+	}()
+	
+	// Don't wait here, just return the result object that can be queried for status
+	return result, nil
 }

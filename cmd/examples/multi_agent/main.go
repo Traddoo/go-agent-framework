@@ -48,9 +48,25 @@ func main() {
 	commBus := comms.NewInMemoryBus()
 	commBus.Initialize(ctx)
 
-	// Register standard tools
+	// Create and register necessary tools for all agents
 	toolRegistry := tools.NewToolRegistry()
-	registerStandardTools(toolRegistry, sharedMemory, commBus)
+	documentReadTool := &DocumentReadTool{MemoryStore: sharedMemory}
+	documentUpdateTool := &DocumentUpdateTool{MemoryStore: sharedMemory}
+	
+	// Create a real Brave Search tool (will use mock results if API key not set)
+	braveSearchTool := tools.NewBraveSearchTool("") // Get API key from env var BRAVE_API_KEY
+	
+	// Legacy search tool for backward compatibility
+	searchTool := &SearchTool{}
+	summarizeTool := &SummarizeTool{}
+	messageTool := &MessageTool{CommBus: commBus}
+
+	toolRegistry.RegisterTool(documentReadTool)
+	toolRegistry.RegisterTool(documentUpdateTool)
+	toolRegistry.RegisterTool(braveSearchTool)  // Add the new Brave Search tool
+	toolRegistry.RegisterTool(searchTool)
+	toolRegistry.RegisterTool(summarizeTool)
+	toolRegistry.RegisterTool(messageTool)
 
 	// Create a document in shared memory for agents to collaborate on
 	projectDoc := &memory.Document{
@@ -70,16 +86,30 @@ func main() {
 		log.Fatalf("Failed to create document: %v", err)
 	}
 
-	// Create the research agent
+	// Create the research agent with specific research-focused prompt
 	researchAgentConfig := &agent.Config{
 		Name:               "ResearchAgent",
 		Description:        "An agent specialized in research and information gathering",
 		MaxConcurrentTasks: 1,
 		DefaultSystemPrompt: `You are ResearchAgent, an AI specialized in research and information gathering.
-Your role is to collect, analyze, and summarize information on various topics.
-You have access to tools to search for information and read documents.`,
+
+YOUR TASK:
+Research multi-agent systems and return your findings. Use these exact steps in order:
+
+1. Use brave_search tool to search for information on multi-agent systems
+2. Use document_read tool to check the existing document (project-123)
+3. Prepare a comprehensive summary of your findings
+4. Use document_update tool to save your research findings
+
+Each time you call brave_search, use a specific query for a section:
+- "multi-agent systems definition and overview"
+- "multi-agent systems architecture and components"
+- "multi-agent communication protocols"
+- "multi-agent coordination mechanisms"
+
+DO NOT SKIP STEP 4! You must use document_update at the end.`,
 		LLMProvider:     "anthropic",
-		LLMModel:        "claude-3-5-sonnet",
+		LLMModel:        "claude-3-7-sonnet-20250219",
 		ModelParameters: map[string]interface{}{"temperature": 0.2},
 	}
 	
@@ -95,16 +125,29 @@ You have access to tools to search for information and read documents.`,
 		}
 	}
 
-	// Create the writing agent
+	// Create the writing agent with specific writing-focused prompt
 	writingAgentConfig := &agent.Config{
 		Name:               "WritingAgent",
 		Description:        "An agent specialized in writing and content creation",
 		MaxConcurrentTasks: 1,
 		DefaultSystemPrompt: `You are WritingAgent, an AI specialized in writing and content creation.
-Your role is to create high-quality, well-structured documents based on information provided.
-You have access to tools to read and update documents.`,
+
+YOUR TASK:
+Take the research on multi-agent systems and create a well-structured document. Use these exact steps in order:
+
+1. Use document_read tool with document_id="project-123" to read the current document
+2. Use brave_search tool if you need additional information on any topic
+3. Format, organize, and expand the content into a well-structured technical document
+4. Use document_update tool to save your final document
+
+Your final document should include:
+- A clear introduction to multi-agent systems
+- Organized sections with headings for different aspects (architecture, communication, etc.)
+- Technical details presented in an accessible way
+
+DO NOT SKIP STEP 4! You must use document_update to save your final document.`,
 		LLMProvider:     "anthropic",
-		LLMModel:        "claude-3-5-sonnet",
+		LLMModel:        "claude-3-7-sonnet-20250219",
 		ModelParameters: map[string]interface{}{"temperature": 0.7},
 	}
 	
@@ -120,120 +163,95 @@ You have access to tools to read and update documents.`,
 		}
 	}
 
-	// Create the review agent
-	reviewAgentConfig := &agent.Config{
-		Name:               "ReviewAgent",
-		Description:        "An agent specialized in reviewing and providing feedback",
-		MaxConcurrentTasks: 1,
-		DefaultSystemPrompt: `You are ReviewAgent, an AI specialized in reviewing and providing feedback.
-Your role is to review content, check for accuracy, clarity, and completeness.
-You have access to tools to read documents and provide feedback.`,
-		LLMProvider:     "anthropic",
-		LLMModel:        "claude-3-5-sonnet",
-		ModelParameters: map[string]interface{}{"temperature": 0.3},
-	}
-	
-	reviewAgent, err := rt.CreateAgent(ctx, reviewAgentConfig)
-	if err != nil {
-		log.Fatalf("Failed to create review agent: %v", err)
-	}
-	
-	// Register tools with review agent
-	for _, tool := range toolRegistry.ListTools() {
-		if err := reviewAgent.RegisterTool(tool); err != nil {
-			log.Printf("Warning: Failed to register tool %s with review agent: %v", tool.Name(), err)
-		}
-	}
-
-	// Create a team with these agents
-	teamConfig := &agent.TeamConfig{
-		Name:        "ResearchTeam",
-		Description: "A team of agents working together on research projects",
-		AgentIDs:    []string{researchAgent.ID, writingAgent.ID, reviewAgent.ID},
-		TeamStrategy: "orchestrator",
-		CoordinatorID: researchAgent.ID, // Research agent coordinates the work
-	}
-	
-	team, err := rt.CreateTeam(ctx, teamConfig)
-	if err != nil {
-		log.Fatalf("Failed to create team: %v", err)
-	}
-
-	// Create a workflow for the team
-	workflow := createResearchWorkflow(researchAgent.ID, writingAgent.ID, reviewAgent.ID)
-
-	// Create a task for the team with the workflow
-	task := &runtime.Task{
-		Description: "Research and write a comprehensive article on multi-agent systems",
-		Input: map[string]interface{}{
-			"topic": "Multi-Agent Systems in Artificial Intelligence",
-			"requirements": map[string]interface{}{
-				"sections": []string{
-					"Introduction to Multi-Agent Systems",
-					"Architecture and Components",
-					"Communication Protocols",
-					"Coordination Mechanisms",
-					"Real-world Applications",
-					"Future Directions",
+	// Create a workflow that coordinates the research and writing process
+	workflow := &workflow.Workflow{
+		Name: "Research Project Workflow",
+		Steps: []workflow.Step{
+			{
+				Name: "Research Phase",
+				Tasks: []workflow.Task{
+					{
+						AgentID: researchAgent.ID,
+						Input: map[string]interface{}{
+							"action": "research",
+							"sections": []string{
+								"Introduction to Multi-Agent Systems",
+								"Architecture and Components",
+								"Communication Protocols",
+								"Coordination Mechanisms",
+								"Real-world Applications",
+								"Future Directions",
+							},
+							"documentID": projectDoc.ID,
+						},
+					},
 				},
-				"minLength": 2000,
-				"maxLength": 5000,
-				"format": "markdown",
-				"style": "technical but accessible",
 			},
-			"documentID": projectDoc.ID,
-			"deadline": time.Now().Add(30 * time.Minute),
+			{
+				Name: "Writing Phase",
+				Tasks: []workflow.Task{
+					{
+						AgentID: writingAgent.ID,
+						Input: map[string]interface{}{
+							"action": "write",
+							"documentID": projectDoc.ID,
+							"style": "technical but accessible",
+							"requirements": map[string]interface{}{
+								"minLength": 2000,
+								"maxLength": 5000,
+								"format": "markdown",
+							},
+						},
+					},
+				},
+			},
 		},
-		Workflow: workflow,
-		Priority: 1,
-		Deadline: time.Now().Add(30 * time.Minute),
 	}
 
-	// Submit the task and wait for completion
-	taskID, err := rt.SubmitTask(ctx, task, team.ID)
+	// Execute the workflow
+	workflowResult, err := rt.ExecuteWorkflow(ctx, workflow)
 	if err != nil {
-		log.Fatalf("Failed to submit task: %v", err)
+		log.Fatalf("Failed to execute workflow: %v", err)
 	}
 
-	// Poll for task completion
+	// Monitor the workflow status
 	for {
-		status, err := rt.GetTaskStatus(ctx, taskID)
-		if err != nil {
-			log.Fatalf("Failed to get task status: %v", err)
-		}
-
+		status := workflowResult.GetStatus()
 		log.Printf("Task status: %s, Progress: %.2f", status.State, status.Progress)
-
+		
 		if status.State == "completed" || status.State == "failed" {
 			if status.State == "completed" {
-				log.Printf("Task completed successfully")
-				
-				// Read the final document
+				// Get the final document
 				finalDoc, err := sharedMemory.ReadDocument(ctx, projectDoc.ID)
 				if err != nil {
 					log.Fatalf("Failed to read final document: %v", err)
 				}
 				
-				// Create output directory if it doesn't exist
-				outputDir := "output"
-				if err := os.MkdirAll(outputDir, 0755); err != nil {
+				// Save to file
+				outputPath := filepath.Join("output", "research_project.md")
+				if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 					log.Fatalf("Failed to create output directory: %v", err)
 				}
 				
-				// Save and display the final document
-				outputPath := filepath.Join(outputDir, "research_project.md")
 				if err := os.WriteFile(outputPath, []byte(finalDoc.Content), 0644); err != nil {
-					log.Fatalf("Failed to save document: %v", err)
+					log.Fatalf("Failed to write output file: %v", err)
 				}
 				
 				log.Printf("Final document saved to: %s", outputPath)
 				log.Printf("Final document content:\n%s", finalDoc.Content)
+				
+				// Check if content was actually updated
+				if len(finalDoc.Content) <= len(projectDoc.Content) {
+					log.Printf("WARNING: Final document doesn't appear to have been significantly updated.")
+				}
 			} else {
-				log.Printf("Task failed: %v", status.Error)
+				log.Printf("Task failed with error: %v", status.Error)
+				// If you uncomment this, you'll get more details on the error:
+				// log.Printf("Error details: %+v", status)
 			}
 			break
 		}
-
+		
 		time.Sleep(5 * time.Second)
 	}
 }
